@@ -366,6 +366,11 @@ class Bot:
         boost = False
         jump = False
 
+        # endgame: few mechs left or the circle is tiny -> kills decide placement.
+        zone = obs.get("zone") or {}
+        alive = float(obs.get("alive", 16))
+        endgame = alive <= 4 or float(zone.get("next_radius", 1e4)) < 60
+
         # engagement discipline: only stand and fight when the odds are fair.
         tgt_hp = (target.get("hp", 1400) if target else 1400)
         tgt_is_npc = bool(target and target.get("kind") == "npc")
@@ -374,7 +379,8 @@ class Bot:
                 tgt_is_npc or
                 n_threats <= 1 or
                 (n_threats == 2 and hp_frac > 0.55) or
-                tgt_hp < 350
+                tgt_hp < 350 or
+                (endgame and hp_frac > 0.25)
             )
         )
 
@@ -386,8 +392,9 @@ class Bot:
         elif incoming_mortar is not None or laser_threat is not None:
             mode = "dodge"
         # 3) low & pressured, or swarmed -> break contact behind cover
-        elif (hp_frac < 0.35 and n_threats >= 1) or n_threats >= 3 or \
-             (n_threats >= 2 and hp_frac < 0.6 and not tgt_is_npc):
+        #    (endgame overrides this: kills matter more than hiding)
+        elif not endgame and ((hp_frac < 0.35 and n_threats >= 1) or n_threats >= 3 or
+                              (n_threats >= 2 and hp_frac < 0.6 and not tgt_is_npc)):
             mode = "evade"
         # 4) fair fight -> engage
         elif fair_fight:
@@ -733,4 +740,5 @@ class Bot:
         return jump, boost
 
 
-mf.run(Bot)
+if __name__ == "__main__":
+    mf.run(Bot)
