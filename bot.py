@@ -50,7 +50,8 @@ def point_in_ring(x: float, y: float, ring: List[float]) -> bool:
 
 
 class Prism:
-    __slots__ = ("base", "top", "ring", "holes", "minx", "miny", "maxx", "maxy")
+    __slots__ = ("base", "top", "ring", "holes", "minx", "miny", "maxx", "maxy",
+                 "cx", "cy", "prad")
 
     def __init__(self, base: float, top: float, ring: List[float], holes: List[List[float]]):
         self.base = base
@@ -61,6 +62,9 @@ class Prism:
         ys = ring[1::2]
         self.minx, self.maxx = min(xs), max(xs)
         self.miny, self.maxy = min(ys), max(ys)
+        self.cx = (self.minx + self.maxx) * 0.5
+        self.cy = (self.miny + self.maxy) * 0.5
+        self.prad = 0.5 * math.hypot(self.maxx - self.minx, self.maxy - self.miny)
 
     def contains(self, x: float, y: float, z: float) -> bool:
         if not (self.base <= z <= self.top):
@@ -194,6 +198,8 @@ class Bot:
         self.strafe_sign = 1
         self.last_strafe_flip = 0.0
         self.aim_cmd = [0.0, 0.0]
+        self.target_id: Optional[int] = None
+        self.target_since = 0.0
 
     # ---- helpers -------------------------------------------------------
     def _los(self, me_pos, muzzle_h, tpos, tz_off) -> bool:
@@ -334,8 +340,24 @@ class Bot:
             if ev.get("type") == "damaged" and ev.get("bearing") is not None:
                 self.last_threat_yaw = ev["bearing"]
 
-        # --- choose primary combat target ---
-        target = self._choose_target(me, pos, enemies, npcs, hp_frac)
+        # --- threat assessment: who can actually see & shoot me right now ---
+        muzzle_h = float(stats.get("muzzle_height", 7.0))
+        visible_threats = []
+        threat_cx = threat_cy = 0.0
+        for m in enemies:
+            d = math.sqrt(self._dist2(m["pos"], pos))
+            if d < 170 and self._los(pos, muzzle_h, m["pos"], 4.0):
+                visible_threats.append((d, m))
+                threat_cx += m["pos"][0]
+                threat_cy += m["pos"][1]
+        n_threats = len(visible_threats)
+        if n_threats:
+            threat_cx /= n_threats
+            threat_cy /= n_threats
+        visible_threats.sort(key=lambda dm: dm[0])
+
+        # --- choose primary combat target (with stickiness) ---
+        target = self._choose_target(me, pos, enemies, npcs, hp_frac, t_now)
 
         # default aim: toward target, else toward threat, else travel dir
         desired_aim = list(me.get("aim", [0.0, 0.0]))
@@ -344,20 +366,31 @@ class Bot:
         boost = False
         jump = False
 
-        # ========== MODE SELECTION (priority) ==========
-        mode = "reposition"
+        # engagement discipline: only stand and fight when the odds are fair.
+        tgt_hp = (target.get("hp", 1400) if target else 1400)
+        tgt_is_npc = bool(target and target.get("kind") == "npc")
+        fair_fight = (
+            target is not None and (
+                tgt_is_npc or
+                n_threats <= 1 or
+                (n_threats == 2 and hp_frac > 0.55) or
+                tgt_hp < 350
+            )
+        )
 
+        # ========== MODE SELECTION (priority) ==========
         # 1) hard zone emergency: far outside -> rush in
         if need_zone and not in_zone:
             mode = "zone"
         # 2) dodge imminent mortar / laser
         elif incoming_mortar is not None or laser_threat is not None:
             mode = "dodge"
-        # 3) retreat & heal when low and pressured
-        elif hp_frac < 0.33 and nearest is not None and nearest_d < 130:
-            mode = "retreat"
-        # 4) engage a target
-        elif target is not None:
+        # 3) low & pressured, or swarmed -> break contact behind cover
+        elif (hp_frac < 0.35 and n_threats >= 1) or n_threats >= 3 or \
+             (n_threats >= 2 and hp_frac < 0.6 and not tgt_is_npc):
+            mode = "evade"
+        # 4) fair fight -> engage
+        elif fair_fight:
             mode = "engage"
         # 5) farm / loot when calm
         else:
@@ -390,26 +423,32 @@ class Bot:
                 desired_aim = self._aim_at(me, muzzle_h, target)
                 fire = self._maybe_fire(me, muzzle_h, target, weapons, desired_aim)
 
-        elif mode == "retreat":
-            # move away from nearest threat, toward zone center, break LoS
-            thy = self.last_threat_yaw
-            if nearest is not None:
-                thy = math.atan2(nearest["pos"][1] - pos[1], nearest["pos"][0] - pos[0])
-            if thy is None:
-                thy = 0.0
-            away = thy + math.pi
-            dirx, diry = math.cos(away), math.sin(away)
+        elif mode == "evade":
+            # break line of sight: run behind the nearest cover, away from the swarm.
+            if n_threats:
+                tcx, tcy = threat_cx, threat_cy
+            elif self.last_threat_yaw is not None:
+                tcx = pos[0] + math.cos(self.last_threat_yaw) * 50
+                tcy = pos[1] + math.sin(self.last_threat_yaw) * 50
+            else:
+                tcx, tcy = pos[0], pos[1] - 50
+            cover = self._find_cover(pos, tcx, tcy)
+            if cover is not None:
+                move = self._dir_to(pos, cover)
+            else:
+                away = math.atan2(pos[1] - tcy, pos[0] - tcx)
+                move = [math.cos(away), math.sin(away)]
             if need_zone:
                 zc = self._dir_to(pos, zpoint)
-                dirx += zc[0] * 1.5
-                diry += zc[1] * 1.5
-            move = [dirx, diry]
-            boost = energy > 20
-            # keep facing the threat to protect rear; fire if a clean shot exists
-            if nearest is not None:
-                desired_aim = self._aim_at(me, muzzle_h, nearest)
-                if nearest_d < 90:
-                    fire = self._maybe_fire(me, muzzle_h, nearest, weapons, desired_aim)
+                move = [move[0] + zc[0] * 1.5, move[1] + zc[1] * 1.5]
+            boost = energy > 18
+            # keep facing the nearest threat to protect the rear; snipe if a clean shot is cheap
+            face = visible_threats[0][1] if visible_threats else nearest
+            if face is not None:
+                desired_aim = self._aim_at(me, muzzle_h, face)
+                fd = math.sqrt(self._dist2(face["pos"], pos))
+                if fd < 80 and hp_frac > 0.25:
+                    fire = self._maybe_fire(me, muzzle_h, face, weapons, desired_aim)
 
         elif mode == "engage":
             desired_aim = self._aim_at(me, muzzle_h, target)
@@ -428,8 +467,8 @@ class Bot:
             else:
                 desired_aim = [math.atan2(move[1], move[0]) if (move[0] or move[1]) else desired_aim[0], 0.0]
 
-        # take loot opportunistically in combat-free movement too
-        if mode in ("engage", "retreat", "zone"):
+        # take loot opportunistically while on the move too
+        if mode in ("engage", "evade", "zone"):
             self._maybe_take(act, me, pos, obs, weapons)
 
         # reload when safe and low on ammo
@@ -469,8 +508,8 @@ class Bot:
         return act
 
     # ---- sub-behaviors -------------------------------------------------
-    def _choose_target(self, me, pos, enemies, npcs, hp_frac):
-        """Pick a target worth shooting: visible, in range, favorable."""
+    def _choose_target(self, me, pos, enemies, npcs, hp_frac, t_now):
+        """Pick a target worth shooting: visible, in range, favorable. Sticky."""
         muzzle_h = float((me.get("stats", {}) or {}).get("muzzle_height", 7.0))
         best = None
         best_score = -INF
@@ -483,16 +522,52 @@ class Bot:
             mhp = m.get("hp", 1400)
             # prefer low hp, close targets; penalize distance
             score = 1200.0 - mhp - d * 2.0
+            # stickiness: avoid flip-flopping, finish what we started
+            if self.target_id is not None and m.get("id") == self.target_id:
+                score += 220.0
             if score > best_score:
                 best_score, best = score, m
         # consider NPCs for cube farming only when healthy and nothing better close
-        if best is None and hp_frac > 0.55:
+        if best is None and hp_frac > 0.5:
             for m in npcs:
                 d = math.sqrt(self._dist2(m["pos"], pos))
-                if d < 70 and self._los(pos, muzzle_h, m["pos"], 1.5):
+                if d < 75 and self._los(pos, muzzle_h, m["pos"], 1.5):
                     if best is None or d < math.sqrt(self._dist2(best["pos"], pos)):
                         best = m
+        new_id = best.get("id") if best else None
+        if new_id != self.target_id:
+            self.target_id = new_id
+            self.target_since = t_now
         return best
+
+    def _find_cover(self, pos, tcx, tcy):
+        """A point behind the nearest building that sits between us and the threat."""
+        if not self.world.prisms:
+            return None
+        tdx = tcx - pos[0]
+        tdy = tcy - pos[1]
+        tn = math.hypot(tdx, tdy) or 1.0
+        tdx /= tn
+        tdy /= tn
+        best = None
+        best_d = INF
+        for p in self.world.prisms:
+            if p.top < pos[2] + 3.0:  # too short to hide behind
+                continue
+            dcx = p.cx - pos[0]
+            dcy = p.cy - pos[1]
+            d = math.hypot(dcx, dcy)
+            if d > 75 or d < 3:
+                continue
+            # prism should lie roughly in the threat direction (so going to it breaks LoS)
+            if (dcx * tdx + dcy * tdy) / d < 0.25:
+                continue
+            if d < best_d:
+                best_d, best = d, p
+        if best is None:
+            return None
+        # aim for the far side of that building relative to the threat
+        return [best.cx + tdx * (best.prad + 4.0), best.cy + tdy * (best.prad + 4.0)]
 
     def _aim_at(self, me, muzzle_h, target):
         tvel = target.get("vel", [0, 0, 0])
@@ -508,33 +583,37 @@ class Bot:
         pitch_err = abs(desired_aim[1] - cur[1])
         if not self._los(me["pos"], muzzle_h, target["pos"], 4.0):
             return fire
+        # angular half-size of the target at this range: fire when the shot fits on it.
+        tgt_r = 2.5 * (1.0 + 0.05 * float(target.get("cubes", 0) or 0))
+        ang_tol = clampf(math.atan2(tgt_r, max(d, 1.0)) * 0.9, 0.02, 0.14)
         # gun (slot 0)
         w0 = weapons[0] if len(weapons) > 0 else None
         if w0 and w0.get("kind") == "gun":
             ammo = w0.get("ammo", 1)
-            cd = w0.get("cooldown", 0)
-            tol = max(self.gun_spread * 3.0, 0.045) + min(0.06, d * 0.0005)
-            if (ammo is None or ammo > 0) and yaw_err < tol and pitch_err < 0.12 and d <= self.gun_range:
+            if (ammo is None or ammo > 0) and yaw_err < ang_tol and pitch_err < ang_tol * 1.3 \
+                    and d <= self.gun_range:
                 fire[0] = True
         # slot 1 weapon
         w1 = weapons[1] if len(weapons) > 1 else None
         if w1:
             k = w1.get("kind")
             cd = w1.get("cooldown", 0)
+            charge = w1.get("charge", 0.0) or 0.0
             if k == "lightning":
                 if d <= 44 and yaw_err < 0.26 and (cd is None or cd <= 0):
                     fire[1] = True
             elif k == "laser":
-                # charge while roughly aimed; the server fires on release / full hold
-                charge = w1.get("charge", 0.0) or 0.0
-                if d <= 270 and yaw_err < 0.1 and pitch_err < 0.1:
-                    # hold to charge until near full, then release (fire False) to shoot
-                    fire[1] = charge < self.laser_charge_full * 0.92
-                else:
-                    fire[1] = False
+                # Hold to charge (torso slows), release to fire a hitscan beam.
+                # Start charging only when already well-aimed; hold through to near-full,
+                # then release (fire False) so the beam lands where we aim.
+                if charge > 0.0:
+                    # mid-charge: keep holding until near full, unless we lost the aim badly
+                    fire[1] = charge < self.laser_charge_full * 0.95 and yaw_err < 0.2
+                elif d <= 270 and yaw_err < ang_tol * 1.2 and pitch_err < ang_tol * 1.5:
+                    fire[1] = True
             elif k == "mortar":
                 # only lob when target is far enough that our own splash won't hit
-                if 25 < d <= 200 and yaw_err < 0.12 and (cd is None or cd <= 0):
+                if 25 < d <= 200 and yaw_err < 0.1 and (cd is None or cd <= 0):
                     fire[1] = True
         return fire
 
